@@ -1,6 +1,8 @@
 import argparse
 import boto3
 import os
+import fnmatch
+from typing import Dict, List, Set
 
 
 def main():
@@ -14,36 +16,50 @@ def main():
 
     aws_profile = opts.profile
     aws_region = opts.region
-    ebs_volume_id_file = get_full_path_to(opts.file)
 
-    with open(ebs_volume_id_file, 'r') as _f:
-        ebs_volume_ids = _f.read().splitlines()
+    instance_ids = opts.instance_ids
+    ebs_volume_ids = opts.volume_ids
+
+    if opts.file:
+        ebs_volume_id_file = get_full_path_to(opts.file)
+        with open(ebs_volume_id_file, "r") as _f:
+            ebs_volume_ids.append(_f.read().splitlines())
 
     print("Using the following as script input:")
     print(f"  - AWS Profile: {aws_profile}")
     print(f"  - AWS Region: {aws_region}")
-    print(f"  - EBS Volume ID File: {ebs_volume_id_file}")
+    print(f"  - EBS Volume IDs: {ebs_volume_ids}")
+    print(f"  - Instance IDs: {instance_ids}")
 
-    if not get_confirmation("\nContinue with the script?"):
+    if False and not get_confirmation("\nContinue with the script?"):
         print("\nYou have chosen to stop the script.")
         exit()
 
     ec2_resource, ec2_client = connect_to_aws(aws_profile, aws_region)
 
     print(" \nBegin tagging EC2 volumes!")
-    start_tagging_volumes(ec2_resource, ec2_client, ebs_volume_ids)
+    start_tagging_volumes(
+        ec2_resource,
+        ec2_client,
+        ebs_volume_ids,
+        instance_ids,
+        opts.tags,
+        opts.overwrite,
+        opts.dry_run,
+    )
 
     print("\nScript completed!")
 
+
 def get_full_path_to(input_path):
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    file_name = input_path.split('/')[-1]
+    file_name = input_path.split("/")[-1]
 
     # First check if is next to the script file
-    if os.path.exists(f'{script_dir}/{file_name}'):
-        return f'{script_dir}/{file_name}'
+    if os.path.exists(f"{script_dir}/{file_name}"):
+        return f"{script_dir}/{file_name}"
     # Check the actual input path
-    elif (os.path.exists(input_path)):
+    elif os.path.exists(input_path):
         return input_path
     else:
         raise FileNotFoundError
@@ -53,72 +69,181 @@ def connect_to_aws(aws_profile, aws_region):
     print("\nConnecting into AWS...")
     try:
         aws_session = boto3.Session(profile_name=aws_profile, region_name=aws_region)
-        client = aws_session.client('sts')
-        caller_arn = client.get_caller_identity()['Arn']
+        client = aws_session.client("sts")
+        caller_arn = client.get_caller_identity()["Arn"]
     except Exception as e:
         print(e)
         exit(1)
 
     print(f"Successfully connected into AWS using - {caller_arn}")
-    ec2_resource = aws_session.resource('ec2', region_name=aws_region)
-    ec2_client = aws_session.client('ec2', region_name=aws_region)
+    ec2_resource = aws_session.resource("ec2", region_name=aws_region)
+    ec2_client = aws_session.client("ec2", region_name=aws_region)
 
     return ec2_resource, ec2_client
 
 
-def start_tagging_volumes(ec2_resource, ec2_client, ebs_volume_ids):
-    for vol_id in ebs_volume_ids:
-        print("================================================================")
-        ebs_volume = ec2_resource.Volume(vol_id)
+def filter_tags(tags: Dict[str, str], filter_tags: List[str]) -> Dict[str, str]:
+    """
+    Filter the tags based on the filter_tags list
+    """
+    return {
+        key: value
+        for key, value in tags.items()
+        if any(fnmatch.fnmatch(key, tag) for tag in filter_tags)
+    }
 
-        if ebs_volume.state == 'available':
+
+def start_tagging_volumes(
+    ec2_resource, ec2_client, ebs_volume_ids, instance_ids, tags, overwrite, dry_run
+):
+    # tags_by_instance is a dictionary which contains the instance ID as the key and the tags as the value
+    tags_by_instance: Dict[str, Dict[str:str]] = dict()
+    volumes_by_instance: Dict[str, Set[str]] = dict()
+
+    # iterate over the supplied instances and get the tags and their volumes
+    found_volumes: Set[str] = set()
+    for instance_id in set(instance_ids):
+        tags_by_instance[instance_id] = get_resource_tags(
+            ec2_client, "instance", instance_id
+        )
+        volumes_by_instance[instance_id] = set(
+            get_instance_volumes(ec2_resource, instance_id)
+        )
+        found_volumes.update(volumes_by_instance[instance_id])
+
+    # iterate over the supplied volumes and find the attached instance
+    for vol_id in set(ebs_volume_ids):
+        if vol_id in found_volumes:
+            continue
+        ebs_volume = ec2_resource.Volume(vol_id)
+        if ebs_volume.state == "available":
             # The volume status is 'available', therefore it is not attached to anything
             print(f"Volume ID [{vol_id}] has no attachments")
             print("Skipped tagging this volume")
             continue
+        instance_id = ebs_volume.attachments[0].get("InstanceId")
+        if instance_id not in tags_by_instance:
+            tags_by_instance[instance_id] = get_resource_tags(
+                ec2_client, "instance", instance_id
+            )
+            volumes_by_instance[instance_id] = set([vol_id])
+            found_volumes.add(vol_id)
 
-        # Based on the attachment, this is the EC2 instance which we need to extract the curent tags from
-        instance_id = ebs_volume.attachments[0].get('InstanceId')
-        print(f"Volume ID [{vol_id}] is attached to [{instance_id}]")
+    # now, iterate over instances
+    for instance_id, volumes in volumes_by_instance.items():
+        tags_on_instance = tags_by_instance[instance_id]
+        if tags:
+            tags_on_instance = filter_tags(tags_on_instance, tags)
 
-        tags_to_tag = get_instance_tags(ec2_client, instance_id)
-
-        print("Tagging volume")
-        ec2_client.create_tags(
-            Resources=[vol_id],
-            Tags=tags_to_tag
+        print("================================================================")
+        print(
+            f"Instance ID [{instance_id}] contains the tags{" (filtered)" if tags else ""}: {tags_on_instance}"
         )
-        print("Tagging volume completed!")
+        print(f"Processing volumes: {volumes}")
+
+        for volume_id in volumes:
+            print("--------------------------------")
+            print(f"Processing volume [{volume_id}]")
+            ebs_volume = ec2_resource.Volume(volume_id)
+            tags_on_volume = tags_to_dict(ebs_volume.tags)
+            if tags:
+                tags_on_volume = filter_tags(tags_on_volume, tags)
+
+            new_tags = {
+                key: value
+                for key, value in tags_on_instance.items()
+                if key not in tags_on_volume
+            }
+            same_tags = {
+                key: value
+                for key, value in tags_on_instance.items()
+                if key in tags_on_volume and tags_on_volume[key] == value
+            }
+            differing_tags = {
+                key: value
+                for key, value in tags_on_instance.items()
+                if key in tags_on_volume and tags_on_volume[key] != value
+            }
+            differing_tags_on_volume = {
+                key: value
+                for key, value in tags_on_volume.items()
+                if key in differing_tags
+            }
+            missing_tags = {
+                key: value
+                for key, value in tags_on_volume.items()
+                if key not in tags_on_instance
+            }
+
+            if overwrite:
+                tags_to_apply = {**new_tags, **differing_tags}
+            else:
+                tags_to_apply = new_tags
+
+            if same_tags:
+                print(f"Found identical tags: {same_tags}")
+            if missing_tags:
+                print(f"Found tags on volume missing from instance: {missing_tags}")
+            if tags_to_apply and overwrite:
+                print(f"Adding tags {new_tags} and updating tags {differing_tags}")
+            elif tags_to_apply:
+                print(
+                    f"Adding tags {new_tags}, not overwriting {differing_tags_on_volume} with {differing_tags}"
+                )
+            else:
+                print("No tags to apply")
+                continue
+
+            if not dry_run:
+                print(f"Tagging volume with the following tags: {tags_to_apply}")
+                ec2_client.create_tags(
+                    Resources=[vol_id], Tags=tags_to_dict(tags_to_apply)
+                )
+            else:
+                print(f"Dry run, not tagging volume with tags: {tags_to_apply}")
 
 
-def get_instance_tags(ec2_client, instance_id):
+def tags_to_dict(tags):
+    return {tag["Key"]: tag["Value"] for tag in tags}
+
+
+def dict_to_tags(tags):
+    return [{"Key": key, "Value": value} for key, value in tags.items()]
+
+
+def get_resource_tags(
+    ec2_client, resource_type: str, resource_id: str, verbose: bool = False
+) -> Dict[str, str]:
     instance_tags = ec2_client.describe_tags(
-        Filters=[{'Name': 'resource-id', 'Values': [ instance_id ]}]
-    )['Tags']
+        Filters=[{"Name": "resource-id", "Values": [resource_id]}]
+    )["Tags"]
 
-    print(f"\nThe instance [{instance_id}] contains the following tags:")
-
-    # Need to store the tag and values only. ec2_client response contains additional information which is not needed.
-    tags = list()
-    for tag in instance_tags:
-        tag_key = tag['Key']
-        tag_value = tag['Value']
-
-        print(f" - {tag_key}: {tag_value}")
-
-        # This data type is required to later tag the volume
-        tags.append({
-            'Key': tag_key,
-            'Value': tag_value
-        })
+    tags = tags_to_dict(instance_tags)
+    if verbose:
+        print(
+            f"The {resource_type} [{resource_id}] contains the following tags: {tags}"
+        )
 
     return tags
+
+
+def get_instance_volumes(ec2_resource, instance_id: str, verbose=True) -> List[str]:
+    instance = ec2_resource.Instance(instance_id)
+    volumes = list()
+
+    for volume in instance.volumes.all():
+        volumes.append(volume.id)
+
+    if verbose:
+        print(f"Adding volumes {volumes} from instance {instance_id}")
+
+    return volumes
 
 
 def get_confirmation(prompt):
     input_text = input(f"{prompt} (yes/no): ")
 
-    options = { 'yes': True, 'no': False }
+    options = {"yes": True, "no": False}
 
     try:
         return options[input_text]
@@ -129,9 +254,47 @@ def get_confirmation(prompt):
 
 def get_parser():
     parser = argparse.ArgumentParser(description="Assume role in AWS.")
-    parser.add_argument("-p", "--profile", required=False, help="The AWS profile name (default is 'default')", default='default')
-    parser.add_argument("-r", "--region", required=True, help="The AWS region which the volume ID's are located. e.g. ap-southeast-2")
-    parser.add_argument("-f", "--file", required=True, help="File containing the EBS volume ID's")
+    parser.add_argument(
+        "-p",
+        "--profile",
+        required=False,
+        help="The AWS profile name (default is 'default')",
+        default="default",
+    )
+    parser.add_argument(
+        "-r",
+        "--region",
+        required=True,
+        help="The AWS region which the volume ID's are located. e.g. ap-southeast-2",
+    )
+    parser.add_argument(
+        "-f", "--file", required=False, help="File containing the EBS volume ID's"
+    )
+    parser.add_argument(
+        "--instance-ids",
+        nargs="+",
+        required=False,
+        default=[],
+        help="The EC2 instance IDs to tag the EBS volumes",
+    )
+    parser.add_argument(
+        "--volume-ids",
+        nargs="+",
+        required=False,
+        default=[],
+        help="The EBS volume IDs to tag",
+    )
+    parser.add_argument(
+        "--tags",
+        nargs="+",
+        required=False,
+        help="The tags to apply to the EBS volumes, can contain wildcards",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Overwrite the existing tags"
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Dry run the script")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
 
     return parser
 
