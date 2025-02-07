@@ -44,8 +44,9 @@ def main():
         ebs_volume_ids,
         instance_ids,
         opts.tags,
-        opts.overwrite,
-        opts.dry_run,
+        overwrite=opts.overwrite,
+        verbose=opts.verbose,
+        dry_run=opts.dry_run,
     )
 
     print("\nScript completed!")
@@ -94,7 +95,14 @@ def filter_tags(tags: Dict[str, str], filter_tags: List[str]) -> Dict[str, str]:
 
 
 def start_tagging_volumes(
-    ec2_resource, ec2_client, ebs_volume_ids, instance_ids, tags, overwrite, dry_run
+    ec2_resource,
+    ec2_client,
+    ebs_volume_ids,
+    instance_ids,
+    tags,
+    overwrite,
+    verbose,
+    dry_run,
 ):
     # tags_by_instance is a dictionary which contains the instance ID as the key and the tags as the value
     tags_by_instance: Dict[str, Dict[str:str]] = dict()
@@ -107,7 +115,7 @@ def start_tagging_volumes(
             ec2_client, "instance", instance_id
         )
         volumes_by_instance[instance_id] = set(
-            get_instance_volumes(ec2_resource, instance_id)
+            get_instance_volumes(ec2_resource, instance_id, verbose=verbose)
         )
         found_volumes.update(volumes_by_instance[instance_id])
 
@@ -124,7 +132,7 @@ def start_tagging_volumes(
         instance_id = ebs_volume.attachments[0].get("InstanceId")
         if instance_id not in tags_by_instance:
             tags_by_instance[instance_id] = get_resource_tags(
-                ec2_client, "instance", instance_id
+                ec2_client, "instance", instance_id, verbose=verbose
             )
             volumes_by_instance[instance_id] = set([vol_id])
             found_volumes.add(vol_id)
@@ -132,22 +140,23 @@ def start_tagging_volumes(
     # now, iterate over instances
     for instance_id, volumes in volumes_by_instance.items():
         tags_on_instance = tags_by_instance[instance_id]
+        instance_name = tags_on_instance.get("Name", "N/A")
         if tags:
             tags_on_instance = filter_tags(tags_on_instance, tags)
 
         print("================================================================")
-        print(
-            f"Instance ID [{instance_id}] contains the tags{" (filtered)" if tags else ""}: {tags_on_instance}"
-        )
+        print(f"Processing instance [{instance_id}], Name: {instance_name!r}")
+        print(f"Instance tags{" (filtered)" if tags else ""}: {tags_on_instance}")
         print(f"Processing volumes: {volumes}")
 
         for volume_id in volumes:
             print("--------------------------------")
-            print(f"Processing volume [{volume_id}]")
             ebs_volume = ec2_resource.Volume(volume_id)
             tags_on_volume = tags_to_dict(ebs_volume.tags)
+            volume_name = tags_on_volume.get("Name", "N/A")
             if tags:
                 tags_on_volume = filter_tags(tags_on_volume, tags)
+            print(f"Processing volume [{volume_id}], Name: {volume_name!r}")
 
             new_tags = {
                 key: value
@@ -180,24 +189,29 @@ def start_tagging_volumes(
             else:
                 tags_to_apply = new_tags
 
-            if same_tags:
-                print(f"Found identical tags: {same_tags}")
-            if missing_tags:
-                print(f"Found tags on volume missing from instance: {missing_tags}")
-            if tags_to_apply and overwrite:
-                print(f"Adding tags {new_tags} and updating tags {differing_tags}")
-            elif tags_to_apply:
-                print(
-                    f"Adding tags {new_tags}, not overwriting {differing_tags_on_volume} with {differing_tags}"
-                )
-            else:
+            if verbose:
+                if same_tags:
+                    print(f"Found identical tags: {same_tags}")
+                if missing_tags:
+                    print(f"Found tags on volume missing from instance: {missing_tags}")
+                if tags_to_apply and overwrite:
+                    print(f"Adding tags {new_tags} and updating tags {differing_tags}")
+                elif tags_to_apply:
+                    if differing_tags_on_volume:
+                        print(
+                            f"Adding tags {new_tags}, not overwriting {differing_tags_on_volume} with {differing_tags}"
+                        )
+                    else:
+                        print(f"Adding tags {new_tags}")
+
+            if not tags_to_apply:
                 print("No tags to apply")
                 continue
 
             if not dry_run:
                 print(f"Tagging volume with the following tags: {tags_to_apply}")
                 ec2_client.create_tags(
-                    Resources=[vol_id], Tags=tags_to_dict(tags_to_apply)
+                    Resources=[volume_id], Tags=dict_to_tags(tags_to_apply)
                 )
             else:
                 print(f"Dry run, not tagging volume with tags: {tags_to_apply}")
